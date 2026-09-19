@@ -1,0 +1,313 @@
+<!DOCTYPE html>
+<html lang="hi">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+<title>Photo → PC</title>
+<script src="https://unpkg.com/peerjs@1.5.2/dist/peerjs.min.js"></script>
+<style>
+*{box-sizing:border-box;margin:0;padding:0;font-family:'Segoe UI',system-ui,Arial,sans-serif;-webkit-tap-highlight-color:transparent}
+body{min-height:100vh;background:#07111f;color:#fff;display:flex;justify-content:center;align-items:center;padding:20px;text-align:center}
+
+.card{width:100%;max-width:400px;background:#111d2e;border:1px solid #263750;border-radius:20px;padding:28px 20px;box-shadow:0 20px 50px #0008}
+.card h1{color:#38bdf8;font-size:23px;margin-bottom:10px}
+.card p{color:#94a3b8;font-size:14px;line-height:1.6;margin-bottom:18px}
+
+.hint{background:#0b1626;border:1px dashed #2f4a6b;border-radius:12px;padding:12px 14px;font-size:12.5px;color:#8aa4c2;line-height:1.85;text-align:left;margin-bottom:18px}
+.hint b{color:#facc15}
+.hint .n{display:inline-block;width:17px;height:17px;line-height:17px;text-align:center;background:#1e3a5f;color:#7dd3fc;border-radius:50%;font-size:11px;font-weight:700;margin-right:6px}
+
+.select-btn{width:100%;background:linear-gradient(180deg,#0ea5e9,#0284c7);color:#fff;border:0;border-radius:14px;padding:18px;font-size:17px;font-weight:700;cursor:pointer;transition:.15s}
+.select-btn:active{transform:scale(.97)}
+.select-btn:disabled{background:#334155;cursor:not-allowed;opacity:.7}
+
+#connStatus{margin-top:16px;font-size:13px;color:#facc15;line-height:1.5}
+
+/* Sending view */
+.send-wrap{position:fixed;inset:0;background:#07111f;display:none;flex-direction:column;align-items:center;justify-content:center;z-index:9998;padding:22px;gap:16px}
+.send-wrap h2{color:#38bdf8;font-size:22px}
+.panel{width:100%;max-width:380px;background:#111d2e;border:1px solid #263750;border-radius:16px;padding:20px}
+.bar{height:9px;background:#1e293b;border-radius:99px;overflow:hidden;margin:14px 0 12px}
+.bar i{display:block;height:100%;width:0;background:linear-gradient(90deg,#22c55e,#4ade80);border-radius:99px;transition:width .25s}
+.stat{font-size:14px;color:#e2e8f0;line-height:1.9}
+.stat b{color:#4ade80}
+.stat small{color:#94a3b8;font-size:12px}
+.rec-dot{display:inline-block;width:9px;height:9px;border-radius:50%;background:#22c55e;margin-right:6px;animation:blink 1s infinite}
+@keyframes blink{50%{opacity:.2}}
+.stop-btn{background:#dc2626;color:#fff;border:0;border-radius:12px;padding:14px 32px;font-size:16px;font-weight:700;cursor:pointer}
+.stop-btn:active{transform:scale(.97)}
+.ok-btn{background:#16a34a}
+</style>
+</head>
+<body>
+
+<!-- ===== Main ===== -->
+<div class="card" id="mainCard">
+  <h1>📤 Photo → PC</h1>
+  <p>PC se connect hone ke baad, ek baar photos chuno.<br>Baaki sab <b style="color:#4ade80">khud-ba-khud</b> ho jayega.</p>
+
+  <div class="hint">
+    <span class="n">1</span> Neeche button dabao → Gallery khulegi<br>
+    <span class="n">2</span> Upar <b>⋮ (3 dots)</b> dabao → <b>“Select all”</b><br>
+    <span class="n">3</span> <b>Done</b> dabao — bas! Baaki automatic.
+  </div>
+
+  <button class="select-btn" id="selectBtn" onclick="openFilePicker()" disabled>⏳ PC se connect ho raha hai...</button>
+  <div id="connStatus">PC se connect ho raha hai...</div>
+</div>
+
+<!-- ===== Sending ===== -->
+<div id="sendWrap" class="send-wrap">
+  <h2 id="sendTitle">📤 Bheja ja raha hai</h2>
+
+  <div class="panel">
+    <div class="stat" id="sendInfo">
+      <span class="rec-dot"></span> Taiyaar ho raha hai...
+    </div>
+    <div class="bar"><i id="barFill"></i></div>
+    <div class="stat"><small id="sendSub">—</small></div>
+  </div>
+
+  <button class="stop-btn" id="stopBtn" onclick="stopEverything()">■ Rok do</button>
+</div>
+
+<input type="file" id="fileInput" accept="image/*" multiple hidden>
+
+<script>
+/* ================== CONFIG ================== */
+const PC_PEER_ID  = "pcmedia-receiver-hindi-777";
+const CONCURRENCY = 5;                 // 5 photos ek saath
+const CHUNK_SIZE  = 256 * 1024;        // 256 KB per chunk (bada = tez)
+const HIGH_WATER  = 8 * 1024 * 1024;   // 8 MB se zyada buffer bhar gaya to ruko
+const LOW_WATER   = 1 * 1024 * 1024;   // 1 MB tak khali hone par aage badho
+
+/* ================== STATE ================== */
+let peer=null, conn=null, connected=false;
+let files=[], stopped=false;
+let doneCount=0, doneBytes=0, totalBytesAll=0, failCount=0;
+let startTime=0, wakeLock=null, tickTimer=null;
+
+const fileInput  = document.getElementById("fileInput");
+const connStatus = document.getElementById("connStatus");
+const selectBtn  = document.getElementById("selectBtn");
+const barFill    = document.getElementById("barFill");
+const sendInfo   = document.getElementById("sendInfo");
+const sendSub    = document.getElementById("sendSub");
+const sendTitle  = document.getElementById("sendTitle");
+const stopBtn    = document.getElementById("stopBtn");
+
+/* ================== CONNECT ================== */
+function connectPC(){
+  peer = new Peer({ debug: 1 });
+
+  peer.on("open", () => {
+    connStatus.textContent = "PC mil gaya, connection bana rahe hain...";
+    conn = peer.connect(PC_PEER_ID, { reliable: true });
+
+    conn.on("open", () => {
+      connected = true;
+      connStatus.textContent = "✓ PC se connect ho gaya!";
+      connStatus.style.color = "#4ade80";
+      selectBtn.disabled = false;
+      selectBtn.textContent = "📁 Photos Chuno (Select All)";
+    });
+
+    conn.on("close", () => {
+      connected = false;
+      if(!stopped){
+        connStatus.textContent = "⚠ PC ka connection toot gaya.";
+        connStatus.style.color = "#f87171";
+        selectBtn.disabled = true;
+      }
+    });
+
+    conn.on("error", () => {
+      connStatus.textContent = "Connection error!";
+      connStatus.style.color = "#f87171";
+    });
+  });
+
+  peer.on("error", (e) => {
+    connStatus.textContent = "Server se connect nahi ho pa raha... dubara try karo.";
+    connStatus.style.color = "#f87171";
+  });
+
+  peer.on("disconnected", () => { try{ peer.reconnect(); }catch(e){} });
+}
+connectPC();
+
+/* ================== PICKER ================== */
+function openFilePicker(){
+  if(!connected){ alert("PC se connection nahi hua. Thoda wait karo."); return; }
+  fileInput.value = "";
+  fileInput.click();
+}
+
+fileInput.addEventListener("change", () => {
+  const picked = Array.from(fileInput.files || []);
+  if(!picked.length){ alert("Koi photo select nahi ki gayi."); return; }
+
+  files = picked;
+  document.getElementById("mainCard").style.display = "none";
+  document.getElementById("sendWrap").style.display = "flex";
+  startSending();      // ⬅️ yahin se sab automatic
+});
+
+/* ================== MAIN SENDER (5 parallel) ================== */
+async function startSending(){
+  stopped = false;
+  doneCount = 0; doneBytes = 0; failCount = 0;
+  totalBytesAll = files.reduce((a,f)=>a+f.size, 0);
+  startTime = Date.now();
+
+  sendTitle.textContent = "📤 Bheja ja raha hai";
+  stopBtn.textContent = "■ Rok do";
+  stopBtn.className = "stop-btn";
+  stopBtn.onclick = stopEverything;
+
+  await keepAwake();
+  updateProgress();
+  tickTimer = setInterval(updateProgress, 500);
+
+  let idx = 0;
+  const worker = async () => {
+    while(true){
+      if(stopped) return;
+      const my = idx++;
+      if(my >= files.length) return;
+      try{
+        await sendOne(files[my], my);
+        doneCount++;
+        doneBytes += files[my].size;
+      }catch(err){
+        if(!stopped) failCount++;
+      }
+      updateProgress();
+    }
+  };
+
+  const n = Math.min(CONCURRENCY, files.length);
+  await Promise.all(Array.from({length:n}, worker));
+
+  clearInterval(tickTimer);
+  releaseWake();
+  finish();
+}
+
+/* ================== EK FILE BHEJO ================== */
+async function sendOne(file, index){
+  if(!conn || !conn.open) throw new Error("no-conn");
+
+  const id = "f" + index + "_" + Date.now().toString(36) + Math.random().toString(36).slice(2,7);
+
+  conn.send({
+    type: "file-start",
+    id, name: file.name, size: file.size,
+    mime: file.type || "image/jpeg",
+    index: index, total: files.length
+  });
+
+  const buf = await file.arrayBuffer();
+  const dc  = conn.dataChannel;   // backpressure ke liye
+  let off = 0;
+
+  while(off < buf.byteLength){
+    if(stopped || !conn || !conn.open) throw new Error("stopped");
+
+    if(dc && dc.bufferedAmount > HIGH_WATER){
+      await waitDrain(dc);
+      if(stopped) throw new Error("stopped");
+    }
+
+    const end = Math.min(off + CHUNK_SIZE, buf.byteLength);
+    conn.send({ type: "file-chunk", id, chunk: buf.slice(off, end) });
+    off = end;
+  }
+
+  conn.send({ type: "file-end", id });
+}
+
+function waitDrain(dc){
+  return new Promise(res => {
+    const t = setInterval(() => {
+      if(stopped || !dc || dc.bufferedAmount <= LOW_WATER){
+        clearInterval(t); res();
+      }
+    }, 15);
+  });
+}
+
+/* ================== UI UPDATE ================== */
+function updateProgress(){
+  const total = files.length || 1;
+  const pct   = Math.min(100, (doneCount / total) * 100);
+  barFill.style.width = pct + "%";
+
+  const sec  = Math.max(0.5, (Date.now() - startTime) / 1000);
+  const mbps = (doneBytes / 1024 / 1024 / sec).toFixed(2);
+
+  sendInfo.innerHTML =
+    '<span class="rec-dot"></span> Bheji gayi: <b>' + doneCount + '/' + files.length + '</b>' +
+    (failCount ? ' <span style="color:#f87171">(fail ' + failCount + ')</span>' : '');
+
+  sendSub.textContent =
+    (doneBytes/1024/1024).toFixed(2) + " / " + (totalBytesAll/1024/1024).toFixed(2) +
+    " MB  •  " + mbps + " MB/s";
+}
+
+/* ================== FINISH / STOP ================== */
+function finish(){
+  if(stopped) return;
+  sendTitle.textContent = "✅ Ho gaya!";
+  barFill.style.width = "100%";
+  sendInfo.innerHTML = "✓ Sabhi <b>" + doneCount + "</b> photos PC par pahunch gayi!";
+  sendSub.textContent =
+    (doneBytes/1024/1024).toFixed(2) + " MB  •  " +
+    (((Date.now()-startTime)/1000).toFixed(1)) + " second" +
+    (failCount ? "  •  " + failCount + " fail" : "");
+
+  stopBtn.textContent = "↩ Wapas";
+  stopBtn.className = "stop-btn ok-btn";
+  stopBtn.onclick = backToMain;
+}
+
+function stopEverything(){
+  stopped = true;
+  clearInterval(tickTimer);
+  releaseWake();
+  backToMain("Bhejna rok diya gaya.");
+}
+
+function backToMain(msg){
+  stopped = true;
+  clearInterval(tickTimer);
+  releaseWake();
+  document.getElementById("sendWrap").style.display = "none";
+  document.getElementById("mainCard").style.display = "block";
+  if(msg){
+    connStatus.textContent = msg;
+    connStatus.style.color = "#4ade80";
+  }
+  barFill.style.width = "0%";
+}
+
+/* ================== SCREEN KO JAGTE RAKHO ================== */
+async function keepAwake(){
+  try{
+    if("wakeLock" in navigator){
+      wakeLock = await navigator.wakeLock.request("screen");
+    }
+  }catch(e){}
+}
+function releaseWake(){
+  try{ if(wakeLock) wakeLock.release(); }catch(e){}
+  wakeLock = null;
+}
+document.addEventListener("visibilitychange", async () => {
+  if(document.visibilityState === "visible" && !stopped && doneCount < files.length && files.length){
+    await keepAwake();
+  }
+});
+</script>
+</body>
+</html>
